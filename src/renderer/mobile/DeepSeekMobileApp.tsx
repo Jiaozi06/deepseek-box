@@ -1,6 +1,10 @@
 import { Capacitor } from '@capacitor/core'
 import { Browser } from '@capacitor/browser'
-import { IconArrowLeft, IconArrowUp, IconBrain, IconMenu2, IconPlus, IconSettings, IconWorld, IconX } from '@tabler/icons-react'
+import { Share } from '@capacitor/share'
+import {
+  IconArrowLeft, IconArrowUp, IconBrain, IconCopy, IconMenu2, IconPlus, IconRefresh, IconSettings,
+  IconShare, IconThumbDown, IconThumbUp, IconVolume, IconVolumeOff, IconWorld, IconX,
+} from '@tabler/icons-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -67,6 +71,15 @@ function chatCompletionsUrl(baseUrl: string) {
 function openExternal(url: string) {
   if (Capacitor.isNativePlatform()) void Browser.open({ url })
   else window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function speakText(text: string) {
+  const speech = window.speechSynthesis
+  if (!speech) return
+  speech.cancel()
+  const utterance = new SpeechSynthesisUtterance(text)
+  utterance.lang = /[\u4e00-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
+  speech.speak(utterance)
 }
 
 async function openApiStream(
@@ -179,6 +192,8 @@ export default function DeepSeekMobileApp() {
   const [showKey, setShowKey] = useState(false)
   const [webSearch, setWebSearch] = useState(false)
   const [deepThinking, setDeepThinking] = useState(false)
+  const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({})
   const [copyNotice, setCopyNotice] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -232,9 +247,9 @@ export default function DeepSeekMobileApp() {
     setSettingsOpen(false)
   }, [draftApiBaseUrl, draftKey, draftModel])
 
-  const submit = useCallback(async () => {
-    const text = draft.trim()
-    if (!text || sending) return
+  const submit = useCallback(async (regenerate = false) => {
+    const text = regenerate ? '' : draft.trim()
+    if ((!regenerate && !text) || sending) return
     if (!apiKey) {
       setDraftKey('')
       setSettingsOpen(true)
@@ -242,28 +257,33 @@ export default function DeepSeekMobileApp() {
     }
 
     setError('')
-    setDraft('')
+    if (!regenerate) setDraft('')
     const now = Date.now()
     const id = activeChatId || makeId()
-    const userMessage: ChatMessage = { id: makeId(), role: 'user', content: text }
+    let previousMessages = activeChat?.messages || []
+    if (regenerate && previousMessages.at(-1)?.role === 'assistant') previousMessages = previousMessages.slice(0, -1)
+    const previousUser = regenerate ? [...previousMessages].reverse().find((message) => message.role === 'user') : undefined
+    if (regenerate && !previousUser) return
+    const userMessage: ChatMessage = previousUser || { id: makeId(), role: 'user', content: text }
     const assistantMessage: ChatMessage = { id: makeId(), role: 'assistant', content: '' }
-    const previousMessages = activeChat?.messages || []
     const nextChat: Chat = {
       id,
       title: activeChat?.title || text.replace(/\s+/g, ' ').slice(0, 36),
       updatedAt: now,
-      messages: [...previousMessages, userMessage, assistantMessage],
+      messages: regenerate ? [...previousMessages, assistantMessage] : [...previousMessages, userMessage, assistantMessage],
     }
     setActiveChatId(id)
     setChats((current) => [nextChat, ...current.filter((chat) => chat.id !== id)])
     setSending(true)
     const controller = new AbortController()
     abortRef.current = controller
-    const history = [...previousMessages, userMessage]
+    const history = regenerate ? previousMessages : [...previousMessages, userMessage]
     const requestOptions = { webSearch, deepThinking }
+    let generatedText = ''
 
     try {
       await openApiStream(apiKey, apiBaseUrl, model, history, requestOptions, controller.signal, (update) => {
+        generatedText += update.text || ''
         setChats((current) =>
           current.map((chat) =>
             chat.id === id
@@ -288,6 +308,7 @@ export default function DeepSeekMobileApp() {
           )
         )
       })
+      if (voiceEnabled && generatedText) speakText(generatedText)
     } catch (requestError) {
       if (!controller.signal.aborted) {
         const message = requestError instanceof Error ? requestError.message : '请求失败，请检查网络或 API Key'
@@ -304,7 +325,7 @@ export default function DeepSeekMobileApp() {
       if (abortRef.current === controller) abortRef.current = null
       setSending(false)
     }
-  }, [activeChat, activeChatId, apiBaseUrl, apiKey, deepThinking, draft, model, sending, webSearch])
+  }, [activeChat, activeChatId, apiBaseUrl, apiKey, deepThinking, draft, model, sending, voiceEnabled, webSearch])
 
   const copyMessage = useCallback(async (content: string) => {
     try {
@@ -411,6 +432,9 @@ export default function DeepSeekMobileApp() {
         <div className="model-title" aria-label={activeChat?.title || 'DeepSeek'}>
           <span>{activeChat?.title || 'DeepSeek'}</span>
         </div>
+        <button className="icon-button" aria-label={voiceEnabled ? '关闭自动朗读' : '开启自动朗读'} onClick={() => setVoiceEnabled((value) => !value)}>
+          {voiceEnabled ? <IconVolume size={23} stroke={1.8} /> : <IconVolumeOff size={23} stroke={1.8} />}
+        </button>
         <button className="icon-button" aria-label="新对话" onClick={startNewChat}>
           <IconPlus size={23} stroke={1.8} />
         </button>
@@ -446,9 +470,14 @@ export default function DeepSeekMobileApp() {
               </div>
             ) : null}
             {message.role === 'assistant' && message.content && (
-              <button className="copy-button" onClick={() => void copyMessage(message.content)} aria-label="复制回答">
-                复制
-              </button>
+              <div className="message-actions" aria-label="回答操作">
+                <button className="action-button" aria-label="复制回答" onClick={() => void copyMessage(message.content)}><IconCopy size={21} stroke={1.8} /></button>
+                <button className={`action-button ${feedback[message.id] === 'up' ? 'selected' : ''}`} aria-label="赞同" onClick={() => setFeedback((value) => ({ ...value, [message.id]: value[message.id] === 'up' ? undefined as never : 'up' }))}><IconThumbUp size={21} stroke={1.8} /></button>
+                <button className={`action-button ${feedback[message.id] === 'down' ? 'selected' : ''}`} aria-label="不赞同" onClick={() => setFeedback((value) => ({ ...value, [message.id]: value[message.id] === 'down' ? undefined as never : 'down' }))}><IconThumbDown size={21} stroke={1.8} /></button>
+                <button className="action-button" aria-label="朗读回答" onClick={() => speakText(message.content)}><IconVolume size={21} stroke={1.8} /></button>
+                <button className="action-button" aria-label="分享回答" onClick={() => void Share.share({ title: 'DeepSeek 回答', text: message.content })}><IconShare size={21} stroke={1.8} /></button>
+                <button className="action-button regenerate-action" aria-label="重新生成" disabled={sending} onClick={() => void submit(true)}><IconRefresh size={22} stroke={1.8} /></button>
+              </div>
             )}
           </article>
         ))}
