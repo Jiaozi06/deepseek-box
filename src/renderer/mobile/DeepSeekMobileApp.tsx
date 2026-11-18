@@ -2,18 +2,21 @@ import { Capacitor } from '@capacitor/core'
 import { Browser } from '@capacitor/browser'
 import { Share } from '@capacitor/share'
 import {
-  IconArrowLeft, IconArrowUp, IconBrain, IconCopy, IconMenu2, IconPlus, IconRefresh, IconSettings,
+  IconArrowLeft, IconArrowUp, IconBrain, IconCopy, IconMenu2, IconMicrophone, IconPlus, IconRefresh, IconSettings,
   IconShare, IconThumbDown, IconThumbUp, IconVolume, IconVolumeOff, IconWorld, IconX,
 } from '@tabler/icons-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createNativeResponse } from '@/native/stream-http'
+import { copyText, listenForSpeech, speakText, stopSpeaking } from './native-device'
 import deepSeekLogo from '@/static/logos/deepseek-logo-mark-light.svg'
 
 type ChatRole = 'user' | 'assistant'
 type Source = { title: string; url: string; snippet?: string }
-type ChatMessage = { id: string; role: ChatRole; content: string; reasoning?: string; sources?: Source[]; serverToolCalls?: unknown[] }
+type ChatAttachment = { fileId: string; name: string; mimeType: string; purpose: string }
+type PendingAttachment = ChatAttachment & { localId: string; status: 'uploading' | 'ready' }
+type ChatMessage = { id: string; role: ChatRole; content: string; attachments?: ChatAttachment[]; reasoning?: string; sources?: Source[]; serverToolCalls?: unknown[] }
 type Chat = { id: string; title: string; updatedAt: number; messages: ChatMessage[] }
 
 const CHAT_STORAGE_KEY = 'deepseek-mobile:chats:v1'
@@ -68,18 +71,43 @@ function chatCompletionsUrl(baseUrl: string) {
   return url.endsWith('/chat/completions') ? url : `${url}/chat/completions`
 }
 
+function apiRootUrl(baseUrl: string) {
+  return baseUrl.trim().replace(/\/chat\/completions\/?$/, '').replace(/\/+$/, '')
+}
+
+function filePurpose(file: File) {
+  const extension = file.name.toLowerCase().split('.').pop() || ''
+  if (file.type.startsWith('image/')) return 'user_data'
+  if (['pdf', 'doc', 'docx', 'ppt', 'pptx'].includes(extension)) return 'rich_layout_recognition'
+  if (['txt', 'md', 'csv', 'json', 'js', 'ts', 'py', 'html', 'xml', 'yaml', 'yml', 'log', 'xlsx', 'xls', 'epub', 'mobi'].includes(extension)) return 'user_data'
+  throw new Error(`暂不支持 ${file.name}，请选图片、PDF、Office、文本或表格文件`)
+}
+
+async function uploadApiFile(baseUrl: string, apiKey: string, file: File): Promise<ChatAttachment> {
+  const purpose = filePurpose(file)
+  const limit = purpose === 'user_data' && file.type.startsWith('image/') ? 64 : purpose === 'user_data' ? 32 : 100
+  if (file.size > limit * 1024 * 1024) throw new Error(`${file.name} 超过 ${limit} MB 限制`)
+  const form = new FormData()
+  form.append('purpose', purpose)
+  form.append('file', file, file.name)
+  const response = await fetch(`${apiRootUrl(baseUrl)}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form,
+  })
+  if (!response.ok) {
+    const raw = await response.text().catch(() => '')
+    let reason = raw
+    try { reason = JSON.parse(raw)?.error?.message || raw } catch { /* retain response text */ }
+    throw new Error(reason || `上传失败（${response.status}）`)
+  }
+  const result = await response.json()
+  return { fileId: result.id, name: result.filename || file.name, mimeType: file.type || 'application/octet-stream', purpose }
+}
+
 function openExternal(url: string) {
   if (Capacitor.isNativePlatform()) void Browser.open({ url })
   else window.open(url, '_blank', 'noopener,noreferrer')
-}
-
-function speakText(text: string) {
-  const speech = window.speechSynthesis
-  if (!speech) return
-  speech.cancel()
-  const utterance = new SpeechSynthesisUtterance(text)
-  utterance.lang = /[\u4e00-\u9fff]/.test(text) ? 'zh-CN' : 'en-US'
-  speech.speak(utterance)
 }
 
 async function openApiStream(
@@ -98,7 +126,12 @@ async function openApiStream(
     ...(options.webSearch ? { tools: [{ type: 'deepseek_web_search' }, { type: 'deepseek_read_url' }] } : {}),
     messages: messages.map((message) => ({
       role: message.role,
-      content: message.content,
+      content: message.role === 'user' && message.attachments?.length
+        ? [
+            ...(message.content ? [{ type: 'text', text: message.content }] : []),
+            ...message.attachments.map(({ fileId }) => ({ type: 'file', file_id: fileId })),
+          ]
+        : message.content,
       ...(message.reasoning ? { reasoning_content: message.reasoning } : {}),
       ...(message.serverToolCalls ? { server_tool_calls: message.serverToolCalls } : {}),
     })),
@@ -185,6 +218,7 @@ export default function DeepSeekMobileApp() {
   const [draftApiBaseUrl, setDraftApiBaseUrl] = useState(apiBaseUrl)
   const [draftModel, setDraftModel] = useState(model)
   const [draft, setDraft] = useState('')
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(!apiKey)
   const [sending, setSending] = useState(false)
@@ -193,9 +227,12 @@ export default function DeepSeekMobileApp() {
   const [webSearch, setWebSearch] = useState(false)
   const [deepThinking, setDeepThinking] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [isListening, setIsListening] = useState(false)
+  const [speakingMessageId, setSpeakingMessageId] = useState('')
   const [feedback, setFeedback] = useState<Record<string, 'up' | 'down'>>({})
   const [copyNotice, setCopyNotice] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
@@ -230,7 +267,75 @@ export default function DeepSeekMobileApp() {
     setActiveChatId('')
     setSidebarOpen(false)
     setDraft('')
+    setPendingAttachments([])
   }, [])
+
+  const announce = useCallback((message: string) => {
+    setCopyNotice(message)
+    window.setTimeout(() => setCopyNotice(''), 1800)
+  }, [])
+
+  const readAloud = useCallback(async (id: string, content: string) => {
+    if (speakingMessageId === id) {
+      await stopSpeaking()
+      setSpeakingMessageId('')
+      return
+    }
+    try {
+      await stopSpeaking()
+      setSpeakingMessageId(id)
+      await speakText(content)
+    } catch (error) {
+      announce(error instanceof Error ? error.message : '朗读失败，请检查系统语音设置')
+    } finally {
+      setSpeakingMessageId('')
+    }
+  }, [announce, speakingMessageId])
+
+  const startVoiceInput = useCallback(async () => {
+    if (isListening) return
+    setIsListening(true)
+    try {
+      const result = await listenForSpeech()
+      const text = result.text.trim()
+      if (text) setDraft((current) => current ? `${current} ${text}` : text)
+    } catch (error) {
+      announce(error instanceof Error ? error.message : '语音输入失败')
+    } finally {
+      setIsListening(false)
+    }
+  }, [announce, isListening])
+
+  const uploadFiles = useCallback((fileList: FileList | null) => {
+    const files = Array.from(fileList || [])
+    if (!files.length) return
+    if (!apiKey) {
+      setDraftKey('')
+      setSettingsOpen(true)
+      announce('先配置 API Key，再上传文件')
+      return
+    }
+    for (const file of files) {
+      const localId = makeId()
+      const placeholder: PendingAttachment = {
+        fileId: '',
+        localId,
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        purpose: '',
+        status: 'uploading',
+      }
+      setPendingAttachments((current) => [...current, placeholder])
+      void uploadApiFile(apiBaseUrl, apiKey, file).then((attachment) => {
+        setPendingAttachments((current) => current.map((item) => item.localId === localId
+          ? { ...item, ...attachment, status: 'ready' }
+          : item))
+      }).catch((uploadError) => {
+        setPendingAttachments((current) => current.filter((item) => item.localId !== localId))
+        setError(uploadError instanceof Error ? uploadError.message : `${file.name} 上传失败`)
+      })
+    }
+  }, [announce, apiBaseUrl, apiKey])
 
   const saveSettings = useCallback(() => {
     const next = draftKey.trim()
@@ -249,7 +354,7 @@ export default function DeepSeekMobileApp() {
 
   const submit = useCallback(async (regenerate = false) => {
     const text = regenerate ? '' : draft.trim()
-    if ((!regenerate && !text) || sending) return
+    if ((!regenerate && !text && pendingAttachments.length === 0) || sending || pendingAttachments.some((file) => file.status !== 'ready')) return
     if (!apiKey) {
       setDraftKey('')
       setSettingsOpen(true)
@@ -257,18 +362,26 @@ export default function DeepSeekMobileApp() {
     }
 
     setError('')
-    if (!regenerate) setDraft('')
+    if (!regenerate) {
+      setDraft('')
+      setPendingAttachments([])
+    }
     const now = Date.now()
     const id = activeChatId || makeId()
     let previousMessages = activeChat?.messages || []
     if (regenerate && previousMessages.at(-1)?.role === 'assistant') previousMessages = previousMessages.slice(0, -1)
     const previousUser = regenerate ? [...previousMessages].reverse().find((message) => message.role === 'user') : undefined
     if (regenerate && !previousUser) return
-    const userMessage: ChatMessage = previousUser || { id: makeId(), role: 'user', content: text }
+    const userMessage: ChatMessage = previousUser || {
+      id: makeId(),
+      role: 'user',
+      content: text,
+      attachments: pendingAttachments.map(({ localId: _localId, status: _status, ...attachment }) => attachment),
+    }
     const assistantMessage: ChatMessage = { id: makeId(), role: 'assistant', content: '' }
     const nextChat: Chat = {
       id,
-      title: activeChat?.title || text.replace(/\s+/g, ' ').slice(0, 36),
+      title: activeChat?.title || text.replace(/\s+/g, ' ').slice(0, 36) || userMessage.attachments?.[0]?.name || '文件对话',
       updatedAt: now,
       messages: regenerate ? [...previousMessages, assistantMessage] : [...previousMessages, userMessage, assistantMessage],
     }
@@ -308,7 +421,7 @@ export default function DeepSeekMobileApp() {
           )
         )
       })
-      if (voiceEnabled && generatedText) speakText(generatedText)
+      if (voiceEnabled && generatedText) void readAloud(assistantMessage.id, generatedText)
     } catch (requestError) {
       if (!controller.signal.aborted) {
         const message = requestError instanceof Error ? requestError.message : '请求失败，请检查网络或 API Key'
@@ -325,18 +438,16 @@ export default function DeepSeekMobileApp() {
       if (abortRef.current === controller) abortRef.current = null
       setSending(false)
     }
-  }, [activeChat, activeChatId, apiBaseUrl, apiKey, deepThinking, draft, model, sending, voiceEnabled, webSearch])
+  }, [activeChat, activeChatId, apiBaseUrl, apiKey, deepThinking, draft, model, pendingAttachments, readAloud, sending, voiceEnabled, webSearch])
 
   const copyMessage = useCallback(async (content: string) => {
     try {
-      await navigator.clipboard.writeText(content)
-      setCopyNotice('已复制')
-      window.setTimeout(() => setCopyNotice(''), 1200)
+      await copyText(content)
+      announce('已复制')
     } catch {
-      setCopyNotice('复制失败')
-      window.setTimeout(() => setCopyNotice(''), 1200)
+      announce('复制失败')
     }
-  }, [])
+  }, [announce])
 
   const groupedChats = useMemo(() => {
     const groups = new Map<string, Chat[]>()
@@ -443,6 +554,16 @@ export default function DeepSeekMobileApp() {
       <section ref={scrollRef} className="message-list" aria-live="polite">
         {activeChat?.messages.map((message) => (
           <article key={message.id} className={`message-row ${message.role === 'user' ? 'user-row' : 'assistant-row'}`}>
+            {message.role === 'user' && message.attachments?.length ? (
+              <div className="message-attachment-list">
+                {message.attachments.map((attachment) => (
+                  <div key={attachment.fileId} className="message-attachment">
+                    <span className="attachment-file-icon">{attachment.mimeType.startsWith('image/') ? '图片' : '文件'}</span>
+                    <span>{attachment.name}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             {message.role === 'assistant' && message.reasoning && (
               <details className="thinking-panel" open={sending && message.id === activeChat?.messages.at(-1)?.id}>
                 <summary><IconBrain size={17} /> 深度思考</summary>
@@ -474,7 +595,9 @@ export default function DeepSeekMobileApp() {
                 <button className="action-button" aria-label="复制回答" onClick={() => void copyMessage(message.content)}><IconCopy size={21} stroke={1.8} /></button>
                 <button className={`action-button ${feedback[message.id] === 'up' ? 'selected' : ''}`} aria-label="赞同" onClick={() => setFeedback((value) => ({ ...value, [message.id]: value[message.id] === 'up' ? undefined as never : 'up' }))}><IconThumbUp size={21} stroke={1.8} /></button>
                 <button className={`action-button ${feedback[message.id] === 'down' ? 'selected' : ''}`} aria-label="不赞同" onClick={() => setFeedback((value) => ({ ...value, [message.id]: value[message.id] === 'down' ? undefined as never : 'down' }))}><IconThumbDown size={21} stroke={1.8} /></button>
-                <button className="action-button" aria-label="朗读回答" onClick={() => speakText(message.content)}><IconVolume size={21} stroke={1.8} /></button>
+                <button className={`action-button ${speakingMessageId === message.id ? 'selected' : ''}`} aria-label={speakingMessageId === message.id ? '停止朗读' : '朗读回答'} onClick={() => void readAloud(message.id, message.content)}>
+                  {speakingMessageId === message.id ? <IconVolumeOff size={21} stroke={1.8} /> : <IconVolume size={21} stroke={1.8} />}
+                </button>
                 <button className="action-button" aria-label="分享回答" onClick={() => void Share.share({ title: 'DeepSeek 回答', text: message.content })}><IconShare size={21} stroke={1.8} /></button>
                 <button className="action-button regenerate-action" aria-label="重新生成" disabled={sending} onClick={() => void submit(true)}><IconRefresh size={22} stroke={1.8} /></button>
               </div>
@@ -486,6 +609,28 @@ export default function DeepSeekMobileApp() {
 
       <footer className="composer-area">
         <div className="composer">
+          <input
+            ref={fileInputRef}
+            className="hidden-file-input"
+            type="file"
+            multiple
+            accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.txt,.md,.csv,.json,.js,.ts,.py,.html,.xml,.yaml,.yml,.log,.xlsx,.xls,.epub,.mobi"
+            onChange={(event) => {
+              uploadFiles(event.currentTarget.files)
+              event.currentTarget.value = ''
+            }}
+          />
+          {pendingAttachments.length > 0 && (
+            <div className="pending-files">
+              {pendingAttachments.map((attachment) => (
+                <div key={attachment.localId} className={`pending-file ${attachment.status}`}>
+                  <span>{attachment.status === 'uploading' ? '上传中' : attachment.mimeType.startsWith('image/') ? '图片' : '文件'}</span>
+                  <span className="pending-file-name">{attachment.name}</span>
+                  <button aria-label={`移除 ${attachment.name}`} onClick={() => setPendingAttachments((current) => current.filter((item) => item.localId !== attachment.localId))}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             rows={1}
@@ -502,31 +647,43 @@ export default function DeepSeekMobileApp() {
                 }
               }
             }}
-            placeholder="发消息给 DeepSeek"
+            placeholder={isListening ? '正在聆听…' : '发消息给 DeepSeek'}
             aria-label="发消息给 DeepSeek"
           />
-          <button
-            className={`send-button ${sending ? 'stop-button' : ''}`}
-            aria-label={sending ? '停止生成' : '发送消息'}
-            disabled={!sending && !draft.trim()}
-            onClick={() => {
-              if (sending) {
-                abortRef.current?.abort()
-                setSending(false)
-              } else {
-                void submit()
-              }
-            }}
-          >
-            {sending ? <span className="stop-square" /> : <IconArrowUp size={21} stroke={2.2} />}
-          </button>
-          <div className="composer-options">
-            <button className={`option-chip ${deepThinking ? 'active' : ''}`} onClick={() => setDeepThinking((value) => !value)} aria-pressed={deepThinking}>
-              <IconBrain size={18} stroke={1.8} /> 深度思考
-            </button>
-            <button className={`option-chip search-chip ${webSearch ? 'active' : ''}`} onClick={() => setWebSearch((value) => !value)} aria-pressed={webSearch}>
-              <IconWorld size={18} stroke={1.8} /> 联网搜索
-            </button>
+          <div className="composer-toolbar">
+            <div className="composer-options">
+              <button className={`option-chip ${deepThinking ? 'active' : ''}`} onClick={() => setDeepThinking((value) => !value)} aria-pressed={deepThinking}>
+                <IconBrain size={18} stroke={1.8} /> 深度思考
+              </button>
+              <button className={`option-chip search-chip ${webSearch ? 'active' : ''}`} onClick={() => setWebSearch((value) => !value)} aria-pressed={webSearch}>
+                <IconWorld size={18} stroke={1.8} /> 联网搜索
+              </button>
+            </div>
+            <div className="composer-actions">
+              <button className="composer-tool-button" aria-label="添加图片或文件" onClick={() => fileInputRef.current?.click()}>
+                <IconPlus size={23} stroke={1.8} />
+              </button>
+              <button className={`composer-tool-button microphone-button ${isListening ? 'listening' : ''}`} aria-label="语音输入" disabled={isListening || sending} onClick={() => void startVoiceInput()}>
+                <IconMicrophone size={22} stroke={1.8} />
+              </button>
+              {(sending || draft.trim() || pendingAttachments.length > 0) && (
+                <button
+                  className={`send-button ${sending ? 'stop-button' : ''}`}
+                  aria-label={sending ? '停止生成' : '发送消息'}
+                  disabled={!sending && (pendingAttachments.some((file) => file.status !== 'ready') || (!draft.trim() && pendingAttachments.length === 0))}
+                  onClick={() => {
+                    if (sending) {
+                      abortRef.current?.abort()
+                      setSending(false)
+                    } else {
+                      void submit()
+                    }
+                  }}
+                >
+                  {sending ? <span className="stop-square" /> : <IconArrowUp size={21} stroke={2.2} />}
+                </button>
+              )}
+            </div>
           </div>
         </div>
         <p className="disclaimer">AI 生成内容仅供参考</p>
