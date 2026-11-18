@@ -154,6 +154,7 @@ export default defineConfig(({ mode }) => {
   const isProduction = mode === 'production'
   const isWeb = process.env.CHATBOX_BUILD_PLATFORM === 'web'
   const isMobile = process.env.CHATBOX_BUILD_TARGET === 'mobile_app'
+  const isAndroidStandalone = isMobile && process.env.CHATBOX_BUILD_PLATFORM === 'android'
   const isDesktop = !isWeb && !isMobile
   const requestedTarget = process.env.CHATBOX_ELECTRON_VITE_TARGET
   const rendererDevServer = getRendererDevServerConfig(process.env)
@@ -256,17 +257,19 @@ export default defineConfig(({ mode }) => {
         },
       },
       plugins: [
-        TanStackRouterVite({
-          target: 'react',
-          autoCodeSplitting: true,
-          routesDirectory: './src/renderer/routes',
-          generatedRouteTree: './src/renderer/routeTree.gen.ts',
-        }),
+        isAndroidStandalone
+          ? undefined
+          : TanStackRouterVite({
+              target: 'react',
+              autoCodeSplitting: true,
+              routesDirectory: './src/renderer/routes',
+              generatedRouteTree: './src/renderer/routeTree.gen.ts',
+            }),
         react({}),
         dvhToVh(),
-        injectViewportContent(isDesktop),
+        isAndroidStandalone ? undefined : injectViewportContent(isDesktop),
         isWeb ? injectBaseTag() : undefined,
-        injectReleaseDate(),
+        isAndroidStandalone ? undefined : injectReleaseDate(),
         isWeb ? replacePlausibleDomain() : undefined,
         visualizer({
           filename: 'release/app/dist/renderer/stats.html',
@@ -296,6 +299,7 @@ export default defineConfig(({ mode }) => {
         sourcemap: isProduction ? 'hidden' : true,
         minify: isProduction ? 'esbuild' : false, // Use esbuild for faster, less memory-intensive minification
         rollupOptions: {
+          ...(isAndroidStandalone ? { input: path.resolve(__dirname, 'src/renderer/mobile/index.html') } : {}),
           output: {
             entryFileNames: 'js/[name].[hash].js',
             chunkFileNames: 'js/[name].[hash].js',

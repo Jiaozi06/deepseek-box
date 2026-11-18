@@ -1,6 +1,6 @@
 {
-  "name": "xyz.chatboxapp.ce",
-  "productName": "xyz.chatboxapp.ce",
+  "name": "deepseek-box",
+  "productName": "DeepSeek Box",
   "version": "0.0.1",
   "engines": {
     "node": ">=22.13.0 <23.0.0",
@@ -15,6 +15,9 @@
     "build:main": "cross-env CHATBOX_ELECTRON_VITE_TARGET=main electron-vite build",
     "build:preload": "cross-env CHATBOX_ELECTRON_VITE_TARGET=preload electron-vite build",
     "build:renderer": "cross-env CHATBOX_ELECTRON_VITE_TARGET=renderer electron-vite build",
+    "build:android:web": "cross-env CHATBOX_BUILD_TARGET=mobile_app CHATBOX_BUILD_PLATFORM=android CHATBOX_ELECTRON_VITE_TARGET=renderer electron-vite build",
+    "android:sync": "pnpm run build:android:web && node -e \"const fs=require('fs');const p='release/app/dist/renderer/';fs.writeFileSync(p+'index.html',fs.readFileSync(p+'mobile/index.html','utf8').replaceAll('../','./'))\" && cap sync android",
+    "android:assets": "capacitor-assets generate --android",
     "build:web": "cross-env CHATBOX_BUILD_PLATFORM=web electron-vite build && pnpm run delete-sourcemaps",
     "delete-sourcemaps": "node scripts/delete-source-maps.mjs",
     "postinstall": "node .erb/scripts/postinstall.cjs",
